@@ -133,6 +133,7 @@ services:
       - milvus_data:/var/lib/milvus
     networks:
       - backend
+    gpus: all
     deploy:
       resources:
         reservations:
