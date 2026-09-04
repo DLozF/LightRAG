@@ -136,7 +136,8 @@ services:
 
 networks:
   backend:
-    driver: bridge
+    external: true
+    name: local-hermes_backend
 
 volumes:
   postgres_data:
