@@ -67,6 +67,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+      mineru-api:
+        condition: service_healthy
 
 
 
