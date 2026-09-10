@@ -136,7 +136,6 @@ services:
 
 networks:
   backend:
-    external: true
     name: local-hermes_backend
 
 volumes:
