@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
     && bun run build
 
 # Python build stage - using uv for faster package installation
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM astral/uv:python3.12-bookworm-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_SYSTEM_PYTHON=1
@@ -75,7 +75,7 @@ FROM python:3.12-slim-bookworm
 WORKDIR /app
 
 # Install uv for package management
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=astral/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
 
