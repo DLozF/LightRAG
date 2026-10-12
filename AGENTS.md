@@ -64,25 +64,39 @@ LightRAG writes to independent stores — graph, KV, vector, doc-status — with
 - Every accepted residue is **written down** with its reason and recovery path, next to the code or in the relevant contract. An undocumented residue is a defect; a documented one is a decision.
 - This licenses nothing for **silent failure**. A durable write must never be reported as one that did not happen, and a failure must never be swallowed: fail loud, then let the documented residue heal.
 
+### File-backed storage contracts
+
+**Full contracts: [docs/design/NetworkXSingleWriterContract.md](docs/design/NetworkXSingleWriterContract.md) — read it before touching `lightrag/kg/networkx_impl.py` or any caller of `index_done_callback` on the graph store; [docs/design/FileBackedSnapshotContract.md](docs/design/FileBackedSnapshotContract.md) — read it before touching `lightrag/kg/nano_vector_db_impl.py`, `lightrag/kg/faiss_impl.py`, `lightrag/kg/json_kv_impl.py`, `lightrag/kg/json_doc_status_impl.py` or `lightrag/kg/file_fingerprint.py`.**
+
+Five storages keep their data in memory and publish it by rewriting a whole file, and **they do not share one model** — `JsonKVStorage` and `JsonDocStatusStorage` are the odd ones out and the contracts say so at length. Read the right one before assuming.
+
+- **All five**: a commit publishes the WHOLE namespace, so any writer's flush also publishes every other writer's pending mutation there, half-finished ones included. All five are supported for **small-scale testing and validation only**; no change to them may be justified by write throughput.
+- **`NetworkXStorage`, `NanoVectorDBStorage`, `FaissVectorDBStorage`** keep one in-memory copy per process and reconcile by reloading the file. Visibility rests on a **two-channel fence**: the file's own `(st_mtime_ns, st_size)` (authoritative, state) OR-ed with the `storage_updated` flag (accelerator, a consumable event). Both are permanent — their blind spots do not overlap.
+- Those three diverge on a write conflict, and the reason is in the contracts: the graph store **declines** the commit (it has no buffer to replay, and graph payloads are accumulate-over-read), the vector stores **reload and replay** their pending buffers and redo logs. Do not reopen reload-then-replay for the graph store without addressing the accumulate-over-read argument.
+- **`JsonKVStorage` and `JsonDocStatusStorage` use none of that.** Their data is a `Manager().dict()` every worker shares, so a mutation is visible everywhere immediately and there is nothing to reload — adding a `_get_*` entry method would be wrong. Their `storage_updated` flag means the OPPOSITE of the other three's: `True` is "dirty data still to flush", never "fresher data on disk to reload". Do not read it as a peer notification. `JsonDocStatusStorage` reimplements this protocol rather than inheriting it, so a change to one of the pair is almost always a change the other needs too; where they diverge is the flush trigger — doc-status writes that change scheduling state flush synchronously because doc-status is the pipeline's recovery anchor.
+- `NetworkXStorage` is the only storage that declares `requires_single_writer`, which is what puts the admin flows under `LightRAG._admin_write_gate`.
+
 ### Pipeline concurrency contract
 
 **Full contract: [docs/design/PipelineConcurrencyContract.md](docs/design/PipelineConcurrencyContract.md) — read it before touching `lightrag/pipeline.py`, `lightrag/kg/pipeline_ingress.py`, `pipeline_status` fields, or any `/documents/*` endpoint.**
 
 - Concurrent writers coordinate through `pipeline_status` (per-workspace shared dict in `lightrag.kg.shared_storage`), mutated under `get_namespace_lock("pipeline_status", workspace=...)`.
 - `busy` alone does NOT block enqueue — enqueue + processing are allowed to run concurrently. Three states do refuse it: `destructive_busy` (clear / delete, which drops storages), `scanning_exclusive` (scan's classification phase), and `manual_freeze_requested` (a manual retry draining the pipeline to idle).
+- **Admin graph writes** (`acreate_*` / `aedit_*` / `adelete_by_*` / `amerge_entities` / `ainsert_custom_kg`) run inside `LightRAG._admin_write_gate` when the graph storage declares `requires_single_writer` (`NetworkXStorage` only): a workspace admin lock (waited for) then the `busy` reservation (`kind="admin"`, refuses on `busy` / `scanning`), in that fixed order and OUTSIDE the per-entity keyed locks. A pipeline start during the hold is deferred into the ingress mailbox and driven once on release. The routes' `check_pipeline_busy_or_raise` preflight exempts an `admin`-owned `busy` so a second REST edit reaches the admin lock and queues. Never re-acquire the admin lock inside `lightrag/utils_graph.py`.
 - The workspace **ingress mailbox** (`get_pipeline_ingress(workspace)`) is the pipeline's only wake-up channel; `doc_status` stays the source of truth, so a dropped notification is recovered by the next strict scan.
 - FAILED documents never resume automatically: they re-enter only through a sticky manual retry request (`/documents/scan`, `/documents/reprocess_failed`), granting ONE attempt each.
 - All scheduling-control-plane `doc_status` queries use `get_docs_by_statuses(..., strict=True)`; scheduler `full_docs` reads must distinguish confirmed-absent (`None`) from backend errors (raise).
 
 ### Purge recovery contract
 
-**Full contract: [docs/design/PurgeRecoveryContract.md](docs/design/PurgeRecoveryContract.md) — read it before touching `_purge_kg_contributions`, `adelete_by_doc_id`, the anchor writes in `merge_nodes_and_edges`, or the `kg_write_state` / `kg_purge` metadata.**
+**Full contract: [docs/design/PurgeRecoveryContract.md](docs/design/PurgeRecoveryContract.md) — read it before touching `_purge_kg_contributions`, `adelete_by_doc_id`, the anchor writes in `merge_nodes_and_edges`, the `kg_write_state` / `kg_purge` metadata, or the cache write ordering in `use_llm_func_with_cache`.**
 
 - "What did this document contribute?" is answerable only from the per-document write-ahead anchors (`full_entities` / `full_relations`). The reverse lookup through `text_chunks` is not a fallback — purge deletes those chunks.
 - Governing invariant: **a purge must never delete something that CARRIES attribution — a chunk row or an anchor row that names objects — and leave those objects behind.** `_purge_kg_contributions` **fails closed** (`RecoveryAnchorMissingError` → HTTP 409, nothing deleted) unless one of four proofs holds: `anchors`, `pre_graph`, `journal`, `empty_scope`.
 - **`kg_write_state` must never be inferred or backfilled** — it is written once at enqueue and is monotonic. A backfill reproduces the original silent-skip defect.
 - `kg_write_state` and `kg_purge` must stay in both `_DOC_STATUS_METADATA_CARRY_OVER_KEYS` and `_DOC_STATUS_METADATA_DIRECTIVE_KEYS` (`lightrag/utils_pipeline.py`); dropping either turns a resumable purge into a permanent refusal.
 - Chunk tracking (`entity_chunks` / `relation_chunks`) outranks graph `source_id`; code folding a `source_id` delta back into tracking must append genuine additions only.
+- LLM extraction cache rows are reachable only through the owning chunk's `llm_cache_list`, which makes that list an attribution carrier too: [LLM extraction cache reachability](docs/design/PurgeRecoveryContract.md#llm-extraction-cache-reachability) states the reference-before-row ordering, why a reference that cannot be recorded skips the cache write instead, and what the ordering does not close.
 - Merge and rename apply *Consistency without transactions* above: [the failure model](docs/design/PurgeRecoveryContract.md#merge-and-rename-failure-model) lists their ordering invariants, accepted residues and already-rejected remedies. Read it before reordering `_merge_entities_impl` or the rename branch of `_edit_entity_impl`.
 
 ### Relation weight contract
@@ -168,9 +182,10 @@ bunx tsc --noEmit                  # Typecheck (`bun run build` does NOT typeche
 
 - Use mock-based tests for external services (Redis, httpx, etc.) — do not depend on live services in unit tests.
 - Add regression tests for every bug fix.
-- **Run only the test directories that mirror the modules you changed**, and report which subset you ran plus its pass count. The suite is ~7000 tests and a full run takes over 6 minutes, which is too slow for the edit loop. Every PR's CI runs the full suite — proving nothing else broke is its job, not yours.
+- **Run only the test directories that mirror the modules you changed**, and report which subset you ran plus its pass count. The suite is ~7800 offline tests: about 5 minutes serially, ~70 s with `-n auto` on an 8-core machine — still too slow for the edit loop. Every PR's CI runs the full offline suite (and `tests/setup/` when its inputs change) — proving nothing else broke is its job, not yours.
 - Derive the subset from the mirror layout below: `lightrag/api/config.py` → `tests/api/config/`, `lightrag/kg/redis_impl.py` → `tests/kg/redis_impl/`, `lightrag/chunker/` → `tests/chunker/`. When a change spans several modules, run each of their directories rather than widening to `tests/`.
-- Run the full suite locally only at a milestone, or when the change is genuinely cross-cutting (`lightrag/base.py`, `lightrag/utils.py`, `lightrag/kg/shared_storage.py`, or anything every backend inherits).
+- **`tests/setup/` is the setup wizard's suite and runs only when a wizard input changed**: `scripts/setup/**`, `env.example`, `docker-compose*.yml`, `Makefile`, or `tests/setup/` itself. It never imports `lightrag`, so a `lightrag/` change never needs it. `norecursedirs` in `pyproject.toml` already skips it in every recursive run (`pytest`, `pytest tests`, the full suite, CI's main job); run it by naming it: `./scripts/test.sh tests/setup`. The easy one to miss is `env.example`: adding a config knob for `lightrag` usually edits it, and the wizard parses it, so that change runs `tests/setup/` too.
+- Run the full suite locally only at a milestone, or when the change is genuinely cross-cutting (`lightrag/base.py`, `lightrag/utils.py`, `lightrag/kg/shared_storage.py`, or anything every backend inherits). **Run it with `-n auto --dist worksteal`** (pytest-xdist, in the `pytest` extra): on an 8-core machine it cuts ~5 min to ~1 min. CI stays serial because hosted 4-vCPU runners showed no gain. Do not add `-n` to subset runs: every worker re-collects and re-imports the suite (~12 s), which costs more than a single directory saves. Drop `-n` when you need `pdb`/`-s` or ordered output.
 - Backend tests use pytest; frontend unit tests use Bun's built-in runner — see *WebUI* above and *React component tests* below.
 - **A WebUI change runs the WHOLE frontend check set**, from `lightrag_webui/`: `bun install --frozen-lockfile` (see *WebUI* above — skip it after a branch switch and every later step fails on missing modules), then `bun test`, `bunx tsc --noEmit`, and `bun run lint`. The subsetting rule above is a backend rule and does not apply — all three together take well under a minute (test ~2 s, typecheck ~14 s, lint ~21 s), so there is nothing to save by running less. Report the pass count. `bun run build` transpiles WITHOUT checking types, so skipping `tsc --noEmit` means nothing checks them.
 
@@ -183,10 +198,14 @@ bunx tsc --noEmit                  # Typecheck (`bun run build` does NOT typeche
 # Run specific test file
 ./scripts/test.sh tests/kg/test_graph_storage.py
 
-# Full suite — ~7000 tests, >6 min; milestones and cross-cutting changes only
-./scripts/test.sh tests
+# Full suite — ~7800 offline tests; milestones and cross-cutting changes only.
+# Parallel via pytest-xdist: ~70 s on 8 cores (vs ~5 min serial).
+# tests/setup is skipped by default (norecursedirs); name it explicitly when
+# scripts/setup/, env.example, docker-compose*.yml or Makefile change.
+./scripts/test.sh tests -m offline -n auto --dist worksteal
+./scripts/test.sh tests/setup -m offline -n auto --dist worksteal
 
-# Run with custom workers
+# Integration-test concurrency (a LightRAG fixture, NOT pytest parallelism)
 ./scripts/test.sh tests --test-workers 4
 ```
 
@@ -197,7 +216,7 @@ bunx tsc --noEmit                  # Typecheck (`bun run build` does NOT typeche
   - `tests/llm/<provider>_impl/` for provider-specific behavior, same `_impl` convention: `bedrock_impl/`, `gemini_impl/`, `ollama_impl/`, `openai_impl/`, `voyageai_impl/`, `zhipu_impl/`. `tests/llm/` root holds cross-provider concerns (embedding, VLM, cache, role).
   - `tests/parser/`, `tests/parser/docx/`, `tests/parser/external/{mineru,docling}/` for parser implementations.
   - `tests/pipeline/` for ingestion pipeline and doc-status behavior (including `test_pipeline_*`, `test_doc_status_*`, `test_multimodal_*`, `test_graph_keyed_locks`).
-  - `tests/sidecar/`, `tests/setup/`, `tests/workspace/` for the like-named cross-cutting concerns.
+  - `tests/sidecar/`, `tests/setup/`, `tests/workspace/` for the like-named cross-cutting concerns. `tests/setup/` never imports `lightrag`; it runs in its own path-filtered CI job (`.github/workflows/setup-tests.yml`) and `norecursedirs` keeps it out of every recursive run, so a new input the wizard reads must be added to that workflow's `paths`.
   - When adding a new backend or LLM provider, create a new subdirectory plus an empty `__init__.py` rather than dropping the file in the parent directory root.
 - Markers (registered in `[tool.pytest.ini_options]` in `pyproject.toml`): `offline`, `integration`, `requires_db`, `requires_api`, `pg_smoke`. Integration tests are skipped by default via `-m "not integration"`; opt in with `--run-integration`.
 - Integration env vars: `LIGHTRAG_RUN_INTEGRATION=true`, `LIGHTRAG_KEEP_ARTIFACTS=true`, `LIGHTRAG_TEST_WORKERS=4`, plus storage-specific connection strings.
@@ -341,6 +360,17 @@ See `env.example` for comprehensive template.
 
 ### Language
 Comments, backend code, log messages, and Git commit messages in English. Frontend uses i18next for multi-language support.
+
+### Docstrings and comments
+
+Docstrings state the **rules**: what a caller must do, what it must not do, and the gotchas it will otherwise be caught by. The **mechanism** — how it works, the accepted residues, and the alternatives already rejected — goes in `docs/design/` with a pointer from the docstring. A docstring that has grown into a design document is the thing this separates: it buries the code, and the same facts in two places drift apart.
+
+Two rules are enforced by `tests/test_docstring_budget.py` rather than by review, because both are properties of the tree rather than of any one change:
+
+- **No docstring over 80 lines** (100 for a class). The limit is generous on purpose — it catches a document, not a thorough docstring.
+- **No source line may cite a GitHub issue number.** The referent does not survive a fork, so a comment saying something is "documented in #NNNN" leaves nothing that documents it. Name the thing instead ("the two-channel fence"), or move the content into `docs/design/` and cite that. Never delete such a reference bare — migrate what it pointed at first. Enforced over `lightrag/` only: **tests may cite issue numbers**, and many do. There the number names the defect the test pins, and the test itself — its name, docstring and assertions — is the documentation, so the reference is provenance rather than the thing carrying the meaning.
+
+A third test requires every `docs/**.md` path named in the package to resolve; nothing imports those strings, so a typo is otherwise silent.
 
 ### Python
 - Follow PEP 8 with 4-space indentation

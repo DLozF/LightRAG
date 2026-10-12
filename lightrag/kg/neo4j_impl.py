@@ -63,7 +63,18 @@ READ_RETRY = retry(
 )
 
 
-# @final (removed per request in Issue #3130)
+# Deliberately NOT ``@final``, unlike every other storage class in this package:
+# the decorator was removed by request so this backend can be subclassed. What
+# the tree can show is that nothing in it subclasses this class, so the
+# extension point exists for code outside the repository and cannot be verified
+# from here -- which is a reason to leave it alone, not evidence that restoring
+# it is safe.
+#
+# Before restoring it, note what it would and would not do. ``typing.final`` has
+# no runtime effect: a downstream subclass keeps working, and only a type
+# checker starts rejecting it. So the restore breaks nobody's deployment and
+# silences nobody's tests; it re-asserts the constraint whose removal was asked
+# for, somewhere its author will not see it.
 @dataclass
 class Neo4JStorage(BaseGraphStorage):
     # Lucene query-syntax reserved characters. The full-text query parser
@@ -1881,9 +1892,18 @@ class Neo4JStorage(BaseGraphStorage):
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
         ) as session:
+            # `-[r]-` is undirected with both endpoints free, so the pattern
+            # matcher yields one row per orientation of every relationship --
+            # {a:X, b:Y} and {a:Y, b:X}. Every edge is created through an
+            # undirected MERGE (see upsert_edge), which still gives the
+            # relationship exactly one physical direction in storage, so a
+            # DIRECTED match (`-[r]->`) returns it exactly once with no
+            # DISTINCT and no client-side dedup set -- unlike id(r)-based
+            # dedup, this stays O(1) client memory regardless of graph size,
+            # which iter_edges' batch/yield contract requires.
             query = f"""
-            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
-            RETURN DISTINCT a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
+            MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+            RETURN a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
             """
             result = await session.run(query)
             edges = []
@@ -1902,10 +1922,14 @@ class Neo4JStorage(BaseGraphStorage):
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
         ) as session:
+            # Same undirected-double-count trap as get_all_edges, same fix:
+            # a DIRECTED match returns each relationship exactly once with
+            # no client-side dedup set, keeping this generator's memory use
+            # bounded by batch_size regardless of graph size.
             result = await session.run(
                 f"""
-                MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
-                RETURN DISTINCT a.entity_id AS source, b.entity_id AS target,
+                MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+                RETURN a.entity_id AS source, b.entity_id AS target,
                        properties(r) AS properties
                 """
             )
